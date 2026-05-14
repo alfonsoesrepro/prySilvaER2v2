@@ -10,7 +10,6 @@ using System.Windows.Forms;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Data.OleDb;
-using prySilvaER2v2.BaseDatos;
 
 namespace prySilvaER2v2
 {
@@ -21,207 +20,185 @@ namespace prySilvaER2v2
             InitializeComponent();
         }
 
-        private void Log(string mensaje)
+        private readonly List<string> archivosSeleccionados = new List<string>();
+        
+        private static readonly Dictionary<string, string[]> TablasConocidas = new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase)
         {
-            txtInfo.AppendText(mensaje + Environment.NewLine);
-            Application.DoEvents();
+            { "Articulo",  new[] { "IdArticulo", "Nombre", "IdCategoria", "Precio" } },
+            { "Categoria", new[] { "IdCategoria", "Nombre" } }
+        };
+
+        private void cmdImportar_Click(object sender, EventArgs e)
+        {
+            using (var dlg = new OpenFileDialog())
+            {
+                dlg.Filter = "Archivos de texto (*.txt)|*.txt|Todos los archivos (*.*)|*.*";
+                dlg.Title = "Seleccione archivo(s) de texto";
+                dlg.Multiselect = true;
+
+                if (dlg.ShowDialog() == DialogResult.OK)
+                {
+                    foreach (var ruta in dlg.FileNames)
+                    {
+                        if (!File.Exists(ruta))
+                            continue;
+
+                        if (!archivosSeleccionados.Contains(ruta))
+                        {
+                            archivosSeleccionados.Add(ruta);
+                            lbInfo.Items.Add("Añadido: " + Path.GetFileName(ruta));
+                        }
+                        else
+                        {
+                            lbInfo.Items.Add("Ya existe en la lista: " + Path.GetFileName(ruta));
+                        }
+                    }
+                }
+            }
         }
 
         private void cmdIniciar_Click(object sender, EventArgs e)
         {
-            string articuloFile = Path.Combine(Application.StartupPath, "Articulos.txt");
-            string categoriaFile = Path.Combine(Application.StartupPath, "Categorias.txt");
-            string dbFile = Path.Combine(Application.StartupPath, "Distribuidora.mdb");
-
-            try
+            if (archivosSeleccionados.Count == 0)
             {
-                txtInfo.Clear();
-                Log("Inicio de migración...");
+                lbInfo.Items.Add("No hay archivos seleccionados para migrar.");
+                return;
+            }
 
-                // 1) Crear archivos de ejemplo si no existen
-                CreateSampleFiles(categoriaFile, articuloFile);
+            // Pedir al usuario dónde guardar la base (mdb o accdb)
+            using (var dlg = new SaveFileDialog())
+            {
+                dlg.Title = "Guardar base de datos destino";
+                dlg.Filter = "Access Database (*.accdb)|*.accdb|Access 2003 (*.mdb)|*.mdb";
+                dlg.FileName = "Distribuidora.mdb";
+                dlg.DefaultExt = "mdb";
 
-                // 2) Crear base de datos Access (si no existe)
-                if (!File.Exists(dbFile))
+                if (dlg.ShowDialog() != DialogResult.OK)
                 {
-                    Log("Creando base de datos 'Distribuidora.mdb'...");
-                    bool creado = CreateAccessDatabase(dbFile);
-                    Log(creado ? "Base de datos creada correctamente." : "Error creando base de datos.");
-                }
-                else
-                {
-                    Log("La base de datos ya existe. Se utilizará la existente.");
-                }
-
-                // 3) Conectar a la base de datos
-                var conexion = new CConexion();
-                string cadena = $"Provider=Microsoft.Jet.OLEDB.4.0;Data Source={dbFile};";
-                if (!conexion.Conectar(cadena))
-                {
-                    Log("No se pudo conectar a la base de datos: " + conexion.ObtenerError());
+                    lbInfo.Items.Add("Migración cancelada por el usuario.");
                     return;
                 }
-                Log("Conexión establecida.");
 
-                // 4) Crear tablas (si no existen)
-                // Eliminamos tablas si existen por simplicidad antes de crear
-                conexion.EjecutarComando("DROP TABLE Articulos");
-                conexion.EjecutarComando("DROP TABLE Categorias");
+                var rutaDb = dlg.FileName;
+                var conexion = new CConexion();
 
-                string sqlCategorias = "CREATE TABLE Categorias (Id INTEGER PRIMARY KEY, Descripcion TEXT(100))";
-                string sqlArticulos = "CREATE TABLE Articulos (Codigo INTEGER PRIMARY KEY, Nombre TEXT(100), Precio DOUBLE, Stock INTEGER, CategoriaId INTEGER)";
-
-                if (conexion.EjecutarComando(sqlCategorias))
-                    Log("Tabla 'Categorias' creada.");
-                else
-                    Log("Error creando 'Categorias': " + conexion.ObtenerError());
-
-                if (conexion.EjecutarComando(sqlArticulos))
-                    Log("Tabla 'Articulos' creada.");
-                else
-                    Log("Error creando 'Articulos': " + conexion.ObtenerError());
-
-                // 5) Leer y migrar Categorias
-                Log("Migrando categorías desde archivo: " + categoriaFile);
-                int contCat = 0;
-                foreach (var linea in File.ReadAllLines(categoriaFile))
+                // No existe base o no se pudo abrir, intentar crearla
+                if (!conexion.EnsureDatabaseExists(rutaDb))
                 {
-                    if (string.IsNullOrWhiteSpace(linea)) continue;
-                    var partes = linea.Split(';');
-                    if (partes.Length < 2)
+                    lbInfo.Items.Add("Error: no se pudo crear/asegurar la base -> " + conexion.ObtenerError());
+                    return;
+                }
+
+                // Procesar cada archivo seleccionado
+                foreach (var ruta in archivosSeleccionados.ToList())
+                {
+                    var nombreArchivo = Path.GetFileName(ruta);
+                    var nombreSinExt = Path.GetFileNameWithoutExtension(ruta);
+
+                    // Detectar qué tabla corresponde al archivo 
+                    string[] columnas;
+                    if (!TablasConocidas.TryGetValue(nombreSinExt, out columnas))
                     {
-                        Log("Línea inválida en Categorias.txt: " + linea);
+                        lbInfo.Items.Add("Omitido: " + nombreArchivo +
+                            " — nombre no reconocido (se esperaba Articulo.txt o Categoria.txt)");
                         continue;
                     }
-                    int id;
-                    if (!int.TryParse(partes[0].Trim(), out id))
+
+                    var nombreTabla = nombreSinExt;
+
+                    try
                     {
-                        Log("Id inválido en línea: " + linea);
-                        continue;
+                        var lines = File.ReadAllLines(ruta, Encoding.Default);
+                        if (lines.Length == 0)
+                        {
+                            lbInfo.Items.Add("Error en " + nombreArchivo + ": archivo vacío");
+                            continue;
+                        }
+
+                        // Detectar separador usando la primera línea
+                        char sep = DetectSeparator(lines[0]);
+
+                        // Construir DataTable añadiendo las columnas
+                        var dt = new DataTable();
+                        foreach (var col in columnas)
+                            dt.Columns.Add(col, typeof(string));
+
+                        // Todas las líneas son datos (el .txt NO tiene fila de encabezado)
+                        foreach (var linea in lines)
+                        {
+                            if (string.IsNullOrWhiteSpace(linea))
+                                continue;
+
+                            var parts = SplitLineRespectingQuotes(linea, sep);
+                            var row = dt.NewRow();
+                            for (int c = 0; c < dt.Columns.Count; c++)
+                                row[c] = c < parts.Length ? parts[c].Trim() : string.Empty;
+
+                            dt.Rows.Add(row);
+                        }
+
+                        var ok = conexion.CreateTableFromDataTable(rutaDb, nombreTabla, dt);
+                        if (ok)
+                            lbInfo.Items.Add("Migrado: " + nombreArchivo +
+                                " -> Tabla [" + nombreTabla + "] (" + dt.Rows.Count + " registros)");
+                        else
+                            lbInfo.Items.Add("Error en " + nombreArchivo + ": " + conexion.ObtenerError());
                     }
-                    string descripcion = partes[1].Trim();
-
-                    var cmd = new OleDbCommand("INSERT INTO Categorias (Id, Descripcion) VALUES (?, ?)");
-                    cmd.Parameters.AddWithValue("@Id", id);
-                    cmd.Parameters.AddWithValue("@Descripcion", descripcion);
-
-                    if (conexion.EjecutarComando(cmd))
+                    catch (Exception ex)
                     {
-                        contCat++;
+                        lbInfo.Items.Add("Error en " + nombreArchivo + ": " + ex.Message);
+                    }
+                } 
+
+                lbInfo.Items.Add("Migración finalizada.");
+            } 
+        }
+        
+        // Detecta separador más probable en una línea (prioriza ;, luego ,, luego tab)
+        private char DetectSeparator(string sample)
+        {
+            if (sample.Contains(";")) return ';';
+            if (sample.Contains(",")) return ',';
+            if (sample.Contains("\t")) return '\t';
+            return ',';
+        }
+
+        // Divide una línea por el separador respetando comillas dobles.
+        private string[] SplitLineRespectingQuotes(string line, char separator)
+        {
+            var result = new List<string>();
+            var current = new StringBuilder();
+            bool inQuotes = false;
+
+            for (int i = 0; i < line.Length; i++)
+            {
+                char c = line[i];
+
+                if (c == '"')
+                {
+                    if (inQuotes && i + 1 < line.Length && line[i + 1] == '"')
+                    {
+                        current.Append('"');
+                        i++;
                     }
                     else
                     {
-                        Log("Error insertando categoría: " + conexion.ObtenerError());
+                        inQuotes = !inQuotes;
                     }
                 }
-                Log($"Categorías migradas: {contCat}");
-
-                // 6) Leer y migrar Articulos
-                Log("Migrando artículos desde archivo: " + articuloFile);
-                int contArt = 0;
-                foreach (var linea in File.ReadAllLines(articuloFile))
+                else if (c == separator && !inQuotes)
                 {
-                    if (string.IsNullOrWhiteSpace(linea)) continue;
-                    var partes = linea.Split(';');
-                    if (partes.Length < 5)
-                    {
-                        Log("Línea inválida en Articulos.txt: " + linea);
-                        continue;
-                    }
-                    int codigo;
-                    if (!int.TryParse(partes[0].Trim(), out codigo))
-                    {
-                        Log("Código inválido en línea: " + linea);
-                        continue;
-                    }
-                    string nombre = partes[1].Trim();
-                    double precio;
-                    if (!double.TryParse(partes[2].Trim(), out precio))
-                    {
-                        Log("Precio inválido en línea: " + linea);
-                        continue;
-                    }
-                    int stock;
-                    if (!int.TryParse(partes[3].Trim(), out stock))
-                    {
-                        Log("Stock inválido en línea: " + linea);
-                        continue;
-                    }
-                    int categoriaId;
-                    if (!int.TryParse(partes[4].Trim(), out categoriaId))
-                    {
-                        Log("CategoriaId inválido en línea: " + linea);
-                        continue;
-                    }
-
-                    var cmd = new OleDbCommand("INSERT INTO Articulos (Codigo, Nombre, Precio, Stock, CategoriaId) VALUES (?, ?, ?, ?, ?)");
-                    cmd.Parameters.AddWithValue("@Codigo", codigo);
-                    cmd.Parameters.AddWithValue("@Nombre", nombre);
-                    cmd.Parameters.AddWithValue("@Precio", precio);
-                    cmd.Parameters.AddWithValue("@Stock", stock);
-                    cmd.Parameters.AddWithValue("@CategoriaId", categoriaId);
-
-                    if (conexion.EjecutarComando(cmd))
-                    {
-                        contArt++;
-                    }
-                    else
-                    {
-                        Log("Error insertando artículo: " + conexion.ObtenerError());
-                    }
+                    result.Add(current.ToString());
+                    current.Clear();
                 }
-                Log($"Artículos migrados: {contArt}");
-
-                conexion.Desconectar();
-                Log("Migración finalizada.");
-            }
-            catch (Exception ex)
-            {
-                Log("Error en la migración: " + ex.Message);
-            }
-        }
-
-        private void CreateSampleFiles(string categoriaFile, string articuloFile)
-        {
-            if (!File.Exists(categoriaFile))
-            {
-                var categorias = new string[] {
-                    "1;Procesadores",
-                    "2;Placas Madre",
-                    "3;Memoria RAM",
-                    "4;Discos SSD"
-                };
-                File.WriteAllLines(categoriaFile, categorias, Encoding.UTF8);
-                Log("Archivo 'Categorias.txt' creado de ejemplo.");
-            }
-            else
-            {
-                Log("Archivo 'Categorias.txt' ya existe.");
-            }
-
-            if (!File.Exists(articuloFile))
-            {
-                var articulos = new string[] {
-                    "101;Intel i7;4500.5;10;1",
-                    "102;ASUS Prime;1200;5;2",
-                    "103;Kingston 8GB;800;20;3",
-                    "104;Samsung 970;3500;7;4"
-                };
-                File.WriteAllLines(articuloFile, articulos, Encoding.UTF8);
-                Log("Archivo 'Articulos.txt' creado de ejemplo.");
-            }
-            else
-            {
-                Log("Archivo 'Articulos.txt' ya existe.");
-            }
-        }
-
-        private bool CreateAccessDatabase(string path)
-        {
-            try
-            {
-                // Use ADOX Catalog via COM to create a new .mdb
-                Type catalogType = Type.GetTypeFromProgID("ADOX.Catalog");
-                if (catalogType == null)
+                else
                 {
-                    Log("No se encontró ADOX en el sistema. Asegúrese de tener instalado 'Microsoft ADO Ext. 2.8 for DDL and Security'.");
+                    current.Append(c);
+                }
+            }
+
+            result.Add(current.ToString());
+            return result.ToArray();
+        }
+    }
+}
